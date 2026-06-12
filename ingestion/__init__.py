@@ -63,7 +63,7 @@ from .market_feed import (
 from .news_feed import (
     NewsItem,
     RSSNewsFeed,
-    RedditNewsFeed,
+    #RedditNewsFeed,
     TwitterNewsFeed,
     UnifiedNewsFeed,
     extract_symbols,
@@ -84,7 +84,7 @@ from .alt_data_feed import (
     FearGreedFeed,
     GoogleTrendsFeed,
     PutCallRatioFeed,
-    RedditMentionFeed,
+    # RedditMentionFeed, 
     UnifiedAltDataFeed,
 )
 
@@ -94,13 +94,13 @@ __all__ = [
     # market
     "AlpacaMarketFeed", "PolygonMarketFeed", "MarketTick", "TradeBar",
     # news
-    "UnifiedNewsFeed", "RSSNewsFeed", "RedditNewsFeed", "TwitterNewsFeed",
-    "NewsItem", "extract_symbols",
+    "UnifiedNewsFeed", "RSSNewsFeed", # "RedditNewsFeed",
+    "TwitterNewsFeed", "NewsItem", "extract_symbols",
     # macro
     "UnifiedMacroFeed", "SECFilingFeed", "FREDIndicatorFeed",
     "EarningsCalendarFeed", "FedReserveFeed",
     "MacroEvent", "EarningsEvent", "FedEvent", "EconomicIndicator",
     # alt data
-    "UnifiedAltDataFeed", "RedditMentionFeed", "GoogleTrendsFeed",
-    "FearGreedFeed", "PutCallRatioFeed", "AltDataSignal",
+    "UnifiedAltDataFeed", # "RedditMentionFeed", <-- Comment this out too!
+    "GoogleTrendsFeed", "FearGreedFeed", "PutCallRatioFeed", "AltDataSignal",
 ]

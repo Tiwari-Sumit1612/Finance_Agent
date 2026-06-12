@@ -181,7 +181,9 @@ class RSSNewsFeed:
         self, item: ET.Element, source_name: str, ns: dict
     ) -> Optional[NewsItem]:
         def text(tag: str) -> str:
-            el = item.find(tag) or item.find(f"atom:{tag}", ns)
+            el = item.find(tag)
+            if el is None:
+             el = item.find(f"atom:{tag}", ns)
             return (el.text or "").strip() if el is not None else ""
 
         title   = text("title")

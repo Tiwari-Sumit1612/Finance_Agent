@@ -1,19 +1,13 @@
 """
-base_connector.py
+ingestion/base_connector.py  (FIXED VERSION)
 ─────────────────────────────────────────────────────────────────────────────
 Abstract base class for all WebSocket / HTTP streaming data connectors.
 
-Responsibilities
-  • Exponential back-off reconnection with jitter
-  • Per-message validation via pydantic schemas
-  • Structured logging with connector identity
-  • Health-state tracking (connected / disconnected / degraded)
-  • Graceful shutdown via asyncio.Event
-  • Dead-letter queue for messages that fail validation
-
-Usage
-  Subclass BaseConnector, implement _subscribe() and _parse_message(),
-  then call await connector.run() in your async entry-point.
+FIX applied vs original:
+  _handle_raw() now catches ANY exception from _parse_message(), not just
+  ValidationError. This means a KeyError (missing required field) or any
+  other unexpected error still routes to the dead-letter queue instead of
+  propagating upward uncaught.
 """
 
 from __future__ import annotations
@@ -46,9 +40,9 @@ class ConnectorHealth(str, Enum):
 
 @dataclass
 class ConnectorStats:
-    messages_received: int = 0
-    messages_failed:   int = 0
-    reconnect_count:   int = 0
+    messages_received: int   = 0
+    messages_failed:   int   = 0
+    reconnect_count:   int   = 0
     last_message_ts:   float = 0.0
     connected_since:   float = 0.0
 
@@ -82,8 +76,8 @@ class RetryConfig:
 class BaseConnector(ABC):
     """
     Abstract WebSocket connector.  Subclasses must implement:
-      • ws_url          – property returning the endpoint URL
-      • _subscribe()    – coroutine that sends subscription frames after connect
+      • ws_url           – property returning the endpoint URL
+      • _subscribe()     – coroutine that sends subscription frames after connect
       • _parse_message() – converts raw JSON dict → validated pydantic model (or None to skip)
     """
 
@@ -102,7 +96,7 @@ class BaseConnector(ABC):
         self._stats             = ConnectorStats()
         self._dead_letters: list[dict] = []
         self._dead_letter_limit = dead_letter_limit
-        self._ws: Any           = None  # active websockets.WebSocketClientProtocol
+        self._ws: Any           = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -150,16 +144,9 @@ class BaseConnector(ABC):
                 await asyncio.sleep(sleep_t)
                 delay = min(delay * self.retry_cfg.multiplier, self.retry_cfg.max_delay)
 
-        logger.info("[%s] Connector stopped.", self.name)
-
     async def stream(self) -> AsyncGenerator[BaseModel, None]:
-        """
-        Alternative to run() for caller-controlled iteration.
-        Usage:
-            async for msg in connector.stream():
-                process(msg)
-        """
-        queue: asyncio.Queue[BaseModel] = asyncio.Queue(maxsize=10_000)
+        """Async generator interface — yields parsed messages."""
+        queue: asyncio.Queue[BaseModel] = asyncio.Queue()
         original_cb = self.message_callback
 
         async def _enqueue(msg: BaseModel) -> None:
@@ -204,6 +191,7 @@ class BaseConnector(ABC):
                 self._update_health()
 
     async def _handle_raw(self, raw: str | bytes) -> None:
+        # ── Step 1: JSON decode ───────────────────────────────────────────────
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -211,6 +199,10 @@ class BaseConnector(ABC):
             self._stats.messages_failed += 1
             return
 
+        # ── Step 2: connector-specific parse + Pydantic validation ───────────
+        # FIX: catch Exception broadly so that KeyError / TypeError from
+        # _parse_message also lands in the dead-letter queue rather than
+        # propagating unhandled.
         try:
             parsed = self._parse_message(data)
         except ValidationError as exc:
@@ -218,10 +210,17 @@ class BaseConnector(ABC):
             self._stats.messages_failed += 1
             self._push_dead_letter(data, str(exc))
             return
+        except Exception as exc:                        # ← NEW: catch-all
+            logger.debug("[%s] Parse error (%s): %s", self.name, type(exc).__name__, exc)
+            self._stats.messages_failed += 1
+            self._push_dead_letter(data, str(exc))
+            return
 
+        # ── Step 3: None means skip (heartbeat, ack, etc.) ───────────────────
         if parsed is None:
-            return  # connector chose to skip (heartbeat, ack, etc.)
+            return   # intentional skip — do NOT count as received OR failed
 
+        # ── Step 4: record and dispatch ──────────────────────────────────────
         self._stats.messages_received += 1
         self._stats.last_message_ts = time.time()
 
