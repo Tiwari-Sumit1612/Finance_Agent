@@ -38,7 +38,7 @@ from typing import Optional, Callable, AsyncGenerator
 from xml.etree import ElementTree as ET
 
 import aiohttp
-import asyncpraw
+# import asyncpraw
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -238,90 +238,202 @@ class RSSNewsFeed:
             self.callback = original_cb
 
 
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Reddit feed poller (r/wallstreetbets, r/investing, r/stocks)
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# REDDIT_SUBREDDITS = ["wallstreetbets", "investing", "stocks", "options"]
+
+
+# class RedditNewsFeed:
+#     """
+#     Polls Reddit hot/new posts from financial subreddits.
+#     Uses asyncpraw (official async Reddit API wrapper).
+#     """
+
+#     def __init__(
+#         self,
+#         subreddits: Optional[list[str]] = None,
+#         callback:   Optional[Callable[[NewsItem], None]] = None,
+#         poll_interval: int = 0,
+#         post_limit: int = 25,
+#         watchlist:  Optional[set[str]] = None,
+#     ):
+#         self.subreddits    = subreddits or REDDIT_SUBREDDITS
+#         self.callback      = callback
+#         self.poll_interval = poll_interval or int(os.getenv("REDDIT_POLL_INTERVAL", "120"))
+#         self.post_limit    = post_limit
+#         self.watchlist     = watchlist or set()
+#         self._seen_ids: set[str] = set()
+#         self._stop_event   = asyncio.Event()
+
+#     def stop(self) -> None:
+#         self._stop_event.set()
+
+#     async def run(self) -> None:
+#         reddit = asyncpraw.Reddit(
+#             client_id     = os.environ["REDDIT_CLIENT_ID"],
+#             client_secret = os.environ["REDDIT_CLIENT_SECRET"],
+#             user_agent    = os.getenv("REDDIT_USER_AGENT", "financial-agents/1.0"),
+#         )
+#         logger.info("[RedditNewsFeed] Starting — subreddits: %s", self.subreddits)
+
+#         try:
+#             while not self._stop_event.is_set():
+#                 for sub_name in self.subreddits:
+#                     if self._stop_event.is_set():
+#                         break
+#                     await self._poll_subreddit(reddit, sub_name)
+
+#                 await asyncio.sleep(self.poll_interval)
+#         finally:
+#             await reddit.close()
+
+#     async def _poll_subreddit(self, reddit: asyncpraw.Reddit, sub_name: str) -> None:
+#         try:
+#             subreddit = await reddit.subreddit(sub_name)
+#             async for post in subreddit.new(limit=self.post_limit):
+#                 if post.id in self._seen_ids:
+#                     continue
+#                 self._seen_ids.add(post.id)
+
+#                 full_text = f"{post.title} {post.selftext or ''}"
+#                 symbols   = extract_symbols(full_text, self.watchlist)
+
+#                 item = NewsItem(
+#                     id           = NewsItem.make_id("reddit", post.id),
+#                     title        = post.title,
+#                     summary      = (post.selftext or "")[:500],
+#                     url          = f"https://reddit.com{post.permalink}",
+#                     source       = f"reddit/{sub_name}",
+#                     source_type  = "reddit",
+#                     symbols      = symbols,
+#                     published_at = datetime.fromtimestamp(post.created_utc, tz=timezone.utc),
+#                 )
+
+#                 if self.callback:
+#                     try:
+#                         result = self.callback(item)
+#                         if asyncio.iscoroutine(result):
+#                             await result
+#                     except Exception as exc:
+#                         logger.error("[RedditNewsFeed] Callback error: %s", exc)
+
+#         except Exception as exc:
+#             logger.warning("[RedditNewsFeed] Error polling r/%s: %s", sub_name, exc)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Reddit feed poller (r/wallstreetbets, r/investing, r/stocks)
+# Polygon News Feed
 # ─────────────────────────────────────────────────────────────────────────────
 
-REDDIT_SUBREDDITS = ["wallstreetbets", "investing", "stocks", "options"]
-
-
-class RedditNewsFeed:
+class PolygonNewsFeed:
     """
-    Polls Reddit hot/new posts from financial subreddits.
-    Uses asyncpraw (official async Reddit API wrapper).
+    Polls Polygon.io news endpoint.
+    Requires:
+        POLYGON_API_KEY
+        POLYGON_POLL_INTERVAL (optional)
     """
 
     def __init__(
         self,
-        subreddits: Optional[list[str]] = None,
-        callback:   Optional[Callable[[NewsItem], None]] = None,
+        callback: Optional[Callable[[NewsItem], None]] = None,
         poll_interval: int = 0,
-        post_limit: int = 25,
-        watchlist:  Optional[set[str]] = None,
+        watchlist: Optional[set[str]] = None,
+        limit: int = 50,
     ):
-        self.subreddits    = subreddits or REDDIT_SUBREDDITS
-        self.callback      = callback
-        self.poll_interval = poll_interval or int(os.getenv("REDDIT_POLL_INTERVAL", "120"))
-        self.post_limit    = post_limit
-        self.watchlist     = watchlist or set()
+        self.callback = callback
+        self.poll_interval = poll_interval or int(
+            os.getenv("POLYGON_POLL_INTERVAL", "60")
+        )
+        self.watchlist = watchlist or set()
+        self.limit = limit
+        self.api_key = os.environ["POLYGON_API_KEY"]
+
         self._seen_ids: set[str] = set()
-        self._stop_event   = asyncio.Event()
+        self._stop_event = asyncio.Event()
 
     def stop(self) -> None:
         self._stop_event.set()
 
     async def run(self) -> None:
-        reddit = asyncpraw.Reddit(
-            client_id     = os.environ["REDDIT_CLIENT_ID"],
-            client_secret = os.environ["REDDIT_CLIENT_SECRET"],
-            user_agent    = os.getenv("REDDIT_USER_AGENT", "financial-agents/1.0"),
-        )
-        logger.info("[RedditNewsFeed] Starting — subreddits: %s", self.subreddits)
+        logger.info("[PolygonNewsFeed] Starting")
 
-        try:
+        async with aiohttp.ClientSession() as session:
             while not self._stop_event.is_set():
-                for sub_name in self.subreddits:
-                    if self._stop_event.is_set():
-                        break
-                    await self._poll_subreddit(reddit, sub_name)
+                try:
+                    await self._poll_news(session)
+                except Exception as exc:
+                    logger.warning(
+                        "[PolygonNewsFeed] Poll error: %s",
+                        exc
+                    )
 
                 await asyncio.sleep(self.poll_interval)
-        finally:
-            await reddit.close()
 
-    async def _poll_subreddit(self, reddit: asyncpraw.Reddit, sub_name: str) -> None:
-        try:
-            subreddit = await reddit.subreddit(sub_name)
-            async for post in subreddit.new(limit=self.post_limit):
-                if post.id in self._seen_ids:
-                    continue
-                self._seen_ids.add(post.id)
+    async def _poll_news(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> None:
 
-                full_text = f"{post.title} {post.selftext or ''}"
-                symbols   = extract_symbols(full_text, self.watchlist)
+        url = (
+            "https://api.polygon.io/v2/reference/news"
+            f"?limit={self.limit}"
+            f"&apiKey={self.api_key}"
+        )
 
-                item = NewsItem(
-                    id           = NewsItem.make_id("reddit", post.id),
-                    title        = post.title,
-                    summary      = (post.selftext or "")[:500],
-                    url          = f"https://reddit.com{post.permalink}",
-                    source       = f"reddit/{sub_name}",
-                    source_type  = "reddit",
-                    symbols      = symbols,
-                    published_at = datetime.fromtimestamp(post.created_utc, tz=timezone.utc),
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            payload = await resp.json()
+
+        for article in payload.get("results", []):
+
+            article_id = str(article.get("id"))
+
+            if article_id in self._seen_ids:
+                continue
+
+            self._seen_ids.add(article_id)
+
+            title = article.get("title", "")
+            summary = article.get("description", "")
+            tickers = article.get("tickers", [])
+
+            try:
+                published_at = datetime.fromisoformat(
+                    article["published_utc"].replace(
+                        "Z",
+                        "+00:00"
+                    )
                 )
+            except Exception:
+                published_at = datetime.now(timezone.utc)
 
-                if self.callback:
-                    try:
-                        result = self.callback(item)
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception as exc:
-                        logger.error("[RedditNewsFeed] Callback error: %s", exc)
+            item = NewsItem(
+                id=NewsItem.make_id(
+                    "polygon",
+                    article_id
+                ),
+                title=title,
+                summary=summary[:500],
+                url=article.get("article_url", ""),
+                source="polygon",
+                source_type="polygon",
+                symbols=tickers,
+                published_at=published_at,
+            )
 
-        except Exception as exc:
-            logger.warning("[RedditNewsFeed] Error polling r/%s: %s", sub_name, exc)
+            if self.callback:
+                try:
+                    result = self.callback(item)
 
+                    if asyncio.iscoroutine(result):
+                        await result
+
+                except Exception as exc:
+                    logger.error(
+                        "[PolygonNewsFeed] Callback error: %s",
+                        exc
+                    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Twitter/X filtered stream
@@ -473,7 +585,10 @@ class UnifiedNewsFeed:
     ):
         watchlist  = set(s.upper() for s in symbols)
         self._rss  = RSSNewsFeed(callback=callback, watchlist=watchlist)
-        self._reddit = RedditNewsFeed(callback=callback, watchlist=watchlist)
+        self._polygon = PolygonNewsFeed(
+    callback=callback,
+    watchlist=watchlist
+)
         self._twitter: Optional[TwitterNewsFeed] = (
             TwitterNewsFeed(symbols=symbols, callback=callback, watchlist=watchlist)
             if enable_twitter else None
@@ -481,15 +596,15 @@ class UnifiedNewsFeed:
 
     def stop(self) -> None:
         self._rss.stop()
-        self._reddit.stop()
+        self._polygon.stop()
         if self._twitter:
             self._twitter.stop()
 
     async def run(self) -> None:
-        tasks: list[asyncio.Task] = [
-            asyncio.create_task(self._rss.run()),
-            asyncio.create_task(self._reddit.run()),
-        ]
+        tasks = [
+    asyncio.create_task(self._rss.run()),
+    asyncio.create_task(self._polygon.run()),
+]
         if self._twitter:
             tasks.append(asyncio.create_task(self._twitter.run()))
 

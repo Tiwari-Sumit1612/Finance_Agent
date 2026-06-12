@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Literal, Optional
 
 import aiohttp
-import asyncpraw
+#import asyncpraw
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
@@ -67,119 +67,163 @@ _SUBREDDITS_FOR_MENTIONS = [
 ]
 
 
-class RedditMentionFeed:
+class PolygonOptionsFlowFeed:
     """
-    Counts ticker mentions in recent posts/comments across financial subreddits.
-    Calculates a velocity score = mentions per hour, normalised 0-100.
-    Compares current window against the previous window to detect acceleration.
+    Polygon-based alternative data feed.
+
+    Uses options contract snapshots to estimate unusual activity.
+
+    Signal Logic:
+        volume/open_interest ratio
+
+        ratio > 2.0  -> bullish activity
+        ratio < 0.5  -> bearish activity
+
+    Emits:
+        AltDataSignal(
+            source="polygon",
+            signal_type="options_activity"
+        )
     """
+
+    BASE_URL = "https://api.polygon.io/v3/snapshot/options"
 
     def __init__(
         self,
-        symbols:       list[str],
-        callback:      Optional[Callable[[AltDataSignal], None]] = None,
+        symbols: list[str],
+        callback: Optional[Callable[[AltDataSignal], None]] = None,
         poll_interval: int = 0,
-        window_minutes: int = 60,
     ):
-        self.symbols        = set(s.upper() for s in symbols)
-        self.callback       = callback
-        self.poll_interval  = poll_interval or ALT_POLL_INTERVAL
-        self.window_minutes = window_minutes
-        self._stop_event    = asyncio.Event()
-        # Rolling counts: symbol → list of (timestamp, count) tuples
-        self._windows: dict[str, list[tuple[float, int]]] = {}
-        self._baseline: dict[str, float] = {}   # for normalisation
+        self.symbols = [s.upper() for s in symbols]
+        self.callback = callback
+        self.poll_interval = poll_interval or ALT_POLL_INTERVAL
+
+        self.api_key = os.environ["POLYGON_API_KEY"]
+
+        self._stop_event = asyncio.Event()
 
     def stop(self) -> None:
         self._stop_event.set()
 
     async def run(self) -> None:
-        reddit = asyncpraw.Reddit(
-            client_id     = os.environ["REDDIT_CLIENT_ID"],
-            client_secret = os.environ["REDDIT_CLIENT_SECRET"],
-            user_agent    = os.getenv("REDDIT_USER_AGENT", "financial-agents/1.0"),
+
+        logger.info(
+            "[PolygonOptionsFlowFeed] Starting for %d symbols",
+            len(self.symbols),
         )
-        logger.info("[RedditMentionFeed] Starting mention velocity tracking")
-        try:
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as session:
+
             while not self._stop_event.is_set():
-                counts = await self._count_mentions(reddit)
-                for symbol, count in counts.items():
-                    await self._emit_signal(symbol, count)
+
+                tasks = [
+                    self._poll_symbol(session, symbol)
+                    for symbol in self.symbols
+                ]
+
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+
                 await asyncio.sleep(self.poll_interval)
-        finally:
-            await reddit.close()
 
-    async def _count_mentions(self, reddit: asyncpraw.Reddit) -> dict[str, int]:
-        counts: dict[str, int] = {s: 0 for s in self.symbols}
-        cutoff = time.time() - (self.window_minutes * 60)
+    async def _poll_symbol(
+        self,
+        session: aiohttp.ClientSession,
+        symbol: str,
+    ) -> None:
 
-        for sub_name in _SUBREDDITS_FOR_MENTIONS:
-            try:
-                subreddit = await reddit.subreddit(sub_name)
-                async for post in subreddit.new(limit=50):
-                    if post.created_utc < cutoff:
-                        break
-                    text = f"{post.title} {post.selftext or ''}".upper()
-                    for symbol in self.symbols:
-                        # Match $AAPL or standalone AAPL surrounded by non-alpha
-                        if f"${symbol}" in text or f" {symbol} " in text or f"\n{symbol}\n" in text:
-                            counts[symbol] += 1
-            except Exception as exc:
-                logger.debug("[RedditMentionFeed] r/%s error: %s", sub_name, exc)
+        url = (
+            f"{self.BASE_URL}/{symbol}"
+            f"?limit=250"
+            f"&apiKey={self.api_key}"
+        )
 
-        return {s: c for s, c in counts.items() if c > 0}
+        try:
 
-    async def _emit_signal(self, symbol: str, count: int) -> None:
-        now = time.time()
+            async with session.get(url) as resp:
 
-        # Maintain rolling window
-        if symbol not in self._windows:
-            self._windows[symbol] = []
-        self._windows[symbol].append((now, count))
+                resp.raise_for_status()
 
-        # Keep only last 24h for baseline
-        cutoff = now - 86_400
-        self._windows[symbol] = [
-            (ts, c) for ts, c in self._windows[symbol] if ts > cutoff
-        ]
+                data = await resp.json()
 
-        # Velocity = mentions / hour in current window
-        velocity = count * (60 / self.window_minutes)
+        except Exception as exc:
 
-        # Normalise: compare to 24h average
-        all_counts = [c for _, c in self._windows[symbol]]
-        avg_24h    = sum(all_counts) / len(all_counts) if all_counts else 1.0
-        self._baseline[symbol] = avg_24h
+            logger.debug(
+                "[PolygonOptionsFlowFeed] %s fetch error: %s",
+                symbol,
+                exc,
+            )
 
-        # Score: velocity relative to baseline, capped at 2× = 100
-        raw_ratio = velocity / (avg_24h + 1e-9)
-        score     = min(raw_ratio * 50, 100)          # 2× baseline → 100
+            return
 
-        direction = 1 if raw_ratio > 1.3 else (-1 if raw_ratio < 0.7 else 0)
+        contracts = data.get("results", [])
+
+        if not contracts:
+            return
+
+        total_volume = 0
+        total_open_interest = 0
+
+        for contract in contracts:
+
+            day = contract.get("day", {})
+
+            total_volume += int(
+                day.get("volume", 0) or 0
+            )
+
+            total_open_interest += int(
+                contract.get("open_interest", 0) or 0
+            )
+
+        if total_open_interest <= 0:
+            return
+
+        ratio = total_volume / total_open_interest
+
+        score = min(ratio * 50, 100)
+
+        if ratio > 2.0:
+            direction = 1
+        elif ratio < 0.5:
+            direction = -1
+        else:
+            direction = 0
 
         signal = AltDataSignal(
-            source      = "reddit",
-            signal_type = "mention_velocity",
-            symbol      = symbol,
-            score       = score,
-            direction   = direction,
-            raw_value   = velocity,
-            timestamp   = datetime.now(timezone.utc),
-            metadata    = {
-                "mentions_in_window": count,
-                "window_minutes":     self.window_minutes,
-                "avg_24h":            round(avg_24h, 2),
-                "velocity_per_hour":  round(velocity, 2),
+            source="polygon",
+            signal_type="options_activity",
+            symbol=symbol,
+            score=score,
+            direction=direction,
+            raw_value=ratio,
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "volume": total_volume,
+                "open_interest": total_open_interest,
+                "volume_oi_ratio": round(ratio, 4),
             },
         )
 
         if self.callback:
+
             try:
+
                 result = self.callback(signal)
+
                 if asyncio.iscoroutine(result):
                     await result
+
             except Exception as exc:
-                logger.error("[RedditMentionFeed] Callback error: %s", exc)
+
+                logger.error(
+                    "[PolygonOptionsFlowFeed] Callback error: %s",
+                    exc,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,7 +554,7 @@ class UnifiedAltDataFeed:
         callback:      Optional[Callable[[AltDataSignal], None]] = None,
         enable_trends: bool = True,
     ):
-        self._reddit    = RedditMentionFeed(symbols=symbols, callback=callback)
+        self._polygon_options    = PolygonOptionsFlowFeed(symbols=symbols, callback=callback)
         self._fear_greed = FearGreedFeed(callback=callback)
         self._pcr       = PutCallRatioFeed(callback=callback)
         self._trends: Optional[GoogleTrendsFeed] = (
@@ -519,7 +563,7 @@ class UnifiedAltDataFeed:
         )
 
     def stop(self) -> None:
-        self._reddit.stop()
+        self._polygon_options.stop()
         self._fear_greed.stop()
         self._pcr.stop()
         if self._trends:
@@ -527,7 +571,7 @@ class UnifiedAltDataFeed:
 
     async def run(self) -> None:
         tasks = [
-            asyncio.create_task(self._reddit.run()),
+            asyncio.create_task(self._polygon_options.run()),
             asyncio.create_task(self._fear_greed.run()),
             asyncio.create_task(self._pcr.run()),
         ]
