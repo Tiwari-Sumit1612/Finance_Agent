@@ -26,7 +26,7 @@ class DecisionEngine:
         self.market_agent = MarketAgent()
         self.risk_agent = RiskAgent()
         self.signal_agent = SignalAgent()
-        self.explanation_agent = ExplanationAgent()
+        self.explanation_agent = ExplanationAgent(use_llm=True)
 
     def decide(self, event: FeatureEvent) -> FinalDecision:
         market_output = self.market_agent.run(event)
@@ -40,13 +40,24 @@ class DecisionEngine:
 
         if market_output.decision == "volatile" and final_action == "BUY":
             final_action = "HOLD"
+        
+
+        confidence = (
+           market_output.confidence
+           + risk_output.confidence
+          + signal_output.confidence
+        ) / 3
 
         explanation_output = self.explanation_agent.run(
             {
-                "market": market_output,
-                "risk": risk_output,
-                "signal": signal_output,
-                "final_action": final_action,
+                "symbol": event.symbol,
+        "market": market_output,
+        "risk": risk_output,
+        "signal": signal_output,
+        "final_action": final_action,
+        "confidence": confidence,
+        "market_regime": market_output.decision,
+        "risk_level": risk_output.decision,
             }
         )
 

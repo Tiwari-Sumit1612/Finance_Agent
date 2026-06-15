@@ -1,0 +1,24 @@
+Explain this financial agent decision in simple professional language.
+
+Symbol: {symbol}
+Final Action: {action}
+Confidence: {confidence}
+
+Market Regime: {market_regime}
+Risk Level: {risk_level}
+
+Market Agent Reason:
+{market_reason}
+
+Risk Agent Reason:
+{risk_reason}
+
+Signal Agent Reason:
+{signal_reason}
+
+Rules:
+- Do not claim guaranteed profit.
+- Do not give personal financial advice.
+- Explain why the system produced this action.
+- Keep it short.
+- Use bullet points.
